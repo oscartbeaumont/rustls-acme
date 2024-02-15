@@ -3,8 +3,8 @@ use crate::rework::auth::authorize_all;
 use crate::{CertificateHandle, CertificateInfo, OrderError};
 use async_io::Timer;
 
+use futures_rustls::rustls::ClientConfig;
 use rcgen::{Certificate, CertificateParams, DistinguishedName, PKCS_ECDSA_P256_SHA256};
-use rustls::ClientConfig;
 use std::sync::Arc;
 use std::time::Duration;
 

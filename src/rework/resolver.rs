@@ -6,13 +6,14 @@ use async_notify::Notify;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::future::select;
+use futures_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+use futures_rustls::rustls::sign::CertifiedKey;
+use futures_rustls::rustls::ClientConfig;
 use multi_key_map::MultiKeyMap;
 use pin_project::pin_project;
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::sign::CertifiedKey;
-use rustls::ClientConfig;
 use std::borrow::Borrow;
 use std::collections::HashSet;
+use std::fmt;
 
 use log::error;
 use std::future::Future;
@@ -32,6 +33,16 @@ pub struct StreamlinedResolver<C> {
     notifier: Arc<Notify>,
     updater_handles: Arc<()>,
     cache: C,
+}
+
+impl<C> fmt::Debug for StreamlinedResolver<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamlinedResolver")
+            .field("inner", &self.inner)
+            .field("notifier", &self.notifier)
+            .field("updater_handles", &self.updater_handles)
+            .finish()
+    }
 }
 
 #[pin_project]
@@ -212,7 +223,7 @@ impl<C> StreamlinedResolver<C> {
     }
 
     #[cfg(feature = "axum")]
-    pub fn axum_acceptor(self: &Arc<Self>, rustls_config: Arc<rustls::ServerConfig>) -> crate::axum::AxumAcceptor
+    pub fn axum_acceptor(self: &Arc<Self>, rustls_config: Arc<futures_rustls::rustls::ServerConfig>) -> crate::axum::AxumAcceptor
     where
         C: Send + Sync + 'static,
     {
