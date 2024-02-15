@@ -20,13 +20,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
+use x509_parser::certificate::Validity;
 use x509_parser::parse_x509_certificate;
 
 pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     config: Arc<AcmeConfig<EC, EA>>,
     resolver: Arc<ResolvesServerCertAcme>,
     account_key: Option<Vec<u8>>,
-
     early_action: Option<Pin<Box<dyn Future<Output = Event<EC, EA>> + Send>>>,
     load_cert: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EC>> + Send>>>,
     load_account: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EA>> + Send>>>,
@@ -83,6 +83,16 @@ pub enum OrderError {
     TooManyAttemptsAuth(String),
     #[error("order status stayed on processing too long")]
     ProcessingTimeout(Order),
+    #[error("certificate parsing error: {0}")]
+    CertParse(#[from] CertParseError),
+}
+
+#[derive(Error, Debug)]
+pub enum ResolverError<EC> {
+    #[error("cache error: {0}")]
+    Cache(EC),
+    #[error("certificate parsing error: {0}")]
+    CertParse(#[from] CertParseError),
 }
 
 #[derive(Error, Debug)]
@@ -95,6 +105,10 @@ pub enum CertParseError {
     TooFewPem(usize),
     #[error("unsupported private key type")]
     InvalidPrivateKey,
+    #[error("certificate has no associated dns entries")]
+    NoDns,
+    #[error("certificate does not match expected domains")]
+    InvalidDns,
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
@@ -272,7 +286,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 OrderStatus::Ready => {
                     log::info!("sending csr");
                     let csr = cert.serialize_request_der()?;
-                    order = account.finalize(&config.client_config, order.finalize, csr).await?
+                    order = account.finalize(&config.client_config, order.finalize, &csr).await?
                 }
                 OrderStatus::Valid { certificate } => {
                     log::info!("download certificate");
