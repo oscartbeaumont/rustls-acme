@@ -29,6 +29,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
 
     early_action: Option<Pin<Box<dyn Future<Output = Event<EC, EA>> + Send>>>,
     load_cert: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EC>> + Send>>>,
+    store_cert: Box<dyn Fn(Vec<String>, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<(), EC>> + Send>> + Send>,
     load_account: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EA>> + Send>>>,
     order: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>, OrderError>> + Send>>>,
     backoff_cnt: usize,
@@ -95,6 +96,14 @@ pub enum CertParseError {
     TooFewPem(usize),
     #[error("unsupported private key type")]
     InvalidPrivateKey,
+}
+
+#[derive(Error, Debug)]
+pub enum CertOrderError<EC> {
+    #[error("Error with order: {0}")]
+    Order(#[from] OrderError),
+    #[error("Error saving order: {0}")]
+    EC(EC),
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
@@ -181,6 +190,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 let config = config.clone();
                 async move { config.cache.load_cert(&config.domains, &config.directory_url).await }
             })),
+            store_cert: Box::new({
+                let config = config.clone();
+                move |domains, cert| {
+                    let config = config.clone();
+                    Box::pin(async move { config.cache.store_cert(&domains, &config.directory_url, &cert).await })
+                }
+            }),
             load_account: Some(Box::pin({
                 let config = config.clone();
                 async move { config.cache.load_account(&config.contact, &config.directory_url).await }
@@ -189,6 +205,32 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             backoff_cnt: 0,
             wait: None,
         }
+    }
+    pub async fn order(&mut self, domains: Vec<String>) -> Result<(), CertOrderError<EC>> {
+        // TODO: Deduplicate this logic
+        let account_key = match &self.account_key {
+            None => {
+                let account_key = Account::generate_key_pair();
+                self.account_key = Some(account_key.clone());
+                let config = self.config.clone();
+                let account_key_clone = account_key.clone();
+                self.early_action = Some(Box::pin(async move {
+                    match config
+                        .cache
+                        .store_account(&config.contact, &config.directory_url, &account_key_clone)
+                        .await
+                    {
+                        Ok(()) => Ok(EventOk::AccountCacheStore),
+                        Err(err) => Err(EventError::AccountCacheStore(err)),
+                    }
+                }));
+                account_key
+            }
+            Some(account_key) => account_key.clone(),
+        };
+
+        let cert = Self::order_internal(self.config.clone(), self.resolver.clone(), account_key, domains.clone()).await?;
+        (self.store_cert)(domains, cert).await.map_err(CertOrderError::EC)
     }
     fn parse_cert(pem: &[u8]) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
         let mut pems = pem::parse_many(&pem)?;
@@ -238,16 +280,21 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }));
         Event::Ok(EventOk::DeployedNewCert)
     }
-    async fn order(config: Arc<AcmeConfig<EC, EA>>, resolver: Arc<ResolvesServerCertAcme>, key_pair: Vec<u8>) -> Result<Vec<u8>, OrderError> {
+    async fn order_internal(
+        config: Arc<AcmeConfig<EC, EA>>,
+        resolver: Arc<ResolvesServerCertAcme>,
+        key_pair: Vec<u8>,
+        domains: Vec<String>,
+    ) -> Result<Vec<u8>, OrderError> {
         let directory = Directory::discover(&config.client_config, &config.directory_url).await?;
         let account = Account::create_with_keypair(&config.client_config, directory, &config.contact, &key_pair).await?;
 
-        let mut params = CertificateParams::new(config.domains.clone())?;
+        let mut params = CertificateParams::new(domains.clone())?;
         params.distinguished_name = DistinguishedName::new();
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
         let csr = params.serialize_request(&key_pair)?;
 
-        let (order_url, mut order) = account.new_order(&config.client_config, config.domains.clone()).await?;
+        let (order_url, mut order) = account.new_order(&config.client_config, domains).await?;
         loop {
             match order.status {
                 OrderStatus::Pending => {
@@ -395,7 +442,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             };
             let config = self.config.clone();
             let resolver = self.resolver.clone();
-            self.order = Some(Box::pin(Self::order(config.clone(), resolver.clone(), account_key)));
+            self.order = Some(Box::pin(Self::order_internal(
+                config.clone(),
+                resolver.clone(),
+                account_key,
+                config.domains.clone(),
+            )));
         }
     }
 }
